@@ -71,79 +71,123 @@ def get_data(tickers, proxy):
             
     return data, pd.Series(shares)
 
-def calculate_cap_weighted_index(price_data, shares_data):
+def calculate_indices_and_concentration(price_data, shares_data):
     # Identify standard rebalance dates (first trading day of each quarter)
     standard_rebalances = price_data.index.to_series().resample('BQS').first().dropna()
     
     # Specific dates of index composition changes
     event_dates = pd.to_datetime(['2020-08-31', '2024-02-26', '2024-11-08'])
-    # Find the closest trading day for each event date
     event_trading_days = [price_data.index[price_data.index.searchsorted(d)] for d in event_dates if d in price_data.index or d < price_data.index.max()]
     
-    # Combine and sort all rebalance dates
     rebalance_dates = pd.DatetimeIndex(sorted(list(set(standard_rebalances) | set(event_trading_days))))
     
     index_values = pd.Series(index=price_data.index, dtype=float)
     index_values.iloc[0] = 100.0
+    
+    # Data structures for concentration tracking
+    conc_data = []
     
     current_units = None
     active_tickers = []
     
     for i in range(len(price_data)):
         date = price_data.index[i]
+        prices = price_data.iloc[i]
         
-        # Check if it's a rebalance date (either standard or event)
+        # Check if it's a rebalance date
         if date in rebalance_dates:
-            # Update constituents for this period
-            potential_tickers = get_constituents(date)
-            active_tickers = [t for t in potential_tickers if t in price_data.columns]
+            active_tickers = get_constituents(date)
+            active_tickers = [t for t in active_tickers if t in price_data.columns]
             
-            if len(active_tickers) < 30:
-                print(f"Warning: Only {len(active_tickers)} tickers found for {date}")
-                missing = [t for t in potential_tickers if t not in price_data.columns]
-                print(f"Missing: {missing}")
-
-            prices = price_data[active_tickers].iloc[i]
-            shares = shares_data[active_tickers]
+            p_active = prices[active_tickers]
+            s_active = shares_data[active_tickers]
             
-            # Rebalance logic
-            market_caps = prices * shares
-            weights = market_caps / market_caps.sum()
+            # Cap-Weighted Weights
+            mcaps = p_active * s_active
+            w_cap = mcaps / mcaps.sum()
+            
+            # Price-Weighted Weights (The actual Dow)
+            w_price = p_active / p_active.sum()
+            
+            # Track Concentration (Top 10 - More robust for 30-stock index)
+            top10_cap = w_cap.sort_values(ascending=False).head(10).sum() * 100
+            top10_price = w_price.sort_values(ascending=False).head(10).sum() * 100
+            
+            conc_data.append({
+                'Date': date,
+                'Cap-Weighted Top 10 (%)': top10_cap,
+                'Price-Weighted Top 10 (%)': top10_price
+            })
             
             total_value = index_values.iloc[i-1] if i > 0 else 100.0
-            current_units = (weights * total_value) / prices
+            current_units = (w_cap * total_value) / p_active
             
         # Daily calculation
-        prices = price_data[active_tickers].iloc[i]
-        index_values.iloc[i] = (current_units * prices).sum()
+        p_active = prices[active_tickers]
+        index_values.iloc[i] = (current_units * p_active).sum()
         
-    return index_values
+    return index_values, pd.DataFrame(conc_data)
 
 def main():
     data, shares = get_data(ALL_REQUIRED_TICKERS, PROXY_TICKER)
-    cap_weighted = calculate_cap_weighted_index(data, shares)
+    cap_weighted, concentration = calculate_indices_and_concentration(data, shares)
     
     actual_dow = data[PROXY_TICKER].dropna()
     actual_dow = (actual_dow / actual_dow.iloc[0]) * 100
     
     # Plotting
-    plt.figure(figsize=(12, 7))
-    plt.plot(actual_dow.index, actual_dow, label='Actual Dow (Price-Weighted Proxy: DIA)', color='#003366', linewidth=2)
-    plt.plot(cap_weighted.index, cap_weighted, label='Historical Cap-Weighted Dow (Dynamic Components)', color='#CC0000', linewidth=2, linestyle='--')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12), gridspec_kw={'height_ratios': [2, 1]})
     
-    plt.title('Dow Jones: Price-Weighted vs. Dynamic Cap-Weighted (Since 2020)', fontsize=14, fontweight='bold')
-    plt.xlabel('Date')
-    plt.ylabel('Normalized Index Value (Start = 100)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Chart 1: Performance
+    ax1.plot(actual_dow.index, actual_dow, label='Actual Dow (Price-Weighted Proxy: DIA)', color='#003366', linewidth=2)
+    ax1.plot(cap_weighted.index, cap_weighted, label='Historical Cap-Weighted Dow (Dynamic)', color='#CC0000', linewidth=2, linestyle='--')
+    ax1.set_title('Dow Jones: Performance Comparison (Since 2020)', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Normalized Value (Start = 100)')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
     
     total_ret_actual = (actual_dow.iloc[-1] / actual_dow.iloc[0] - 1) * 100
     total_ret_cap = (cap_weighted.iloc[-1] / cap_weighted.iloc[0] - 1) * 100
     
     stats_text = (f"Actual Dow Total Return: {total_ret_actual:.2f}%\n"
                   f"Cap-Weighted Dow Total Return: {total_ret_cap:.2f}%")
-    plt.annotate(stats_text, xy=(0.05, 0.85), xycoords='axes fraction', bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.8))
+    ax1.annotate(stats_text, xy=(0.05, 0.85), xycoords='axes fraction', bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.8))
     
+    # Chart 2: Concentration (Top 10 Weight)
+    ax2.plot(concentration['Date'], concentration['Price-Weighted Top 10 (%)'], label='Price-Weighted Top 10 Concentration (%)', color='#003366', alpha=0.6)
+    ax2.plot(concentration['Date'], concentration['Cap-Weighted Top 10 (%)'], label='Cap-Weighted Top 10 Concentration (%)', color='#CC0000', alpha=0.8)
+    ax2.set_title('Index Concentration: Combined Weight of Top 10 Components', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Weight (%)')
+    ax2.set_xlabel('Date')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(50, 100) # Adjusted scale for Top 10 concentration
+    
+    # Add Data Labels over the curves (one per year)
+    years_to_label = range(2020, 2027)
+    for year in years_to_label:
+        label_date = pd.Timestamp(year, 7, 1) # Mid-year label
+        if year == 2026: label_date = actual_dow.index.max()
+        
+        if label_date in actual_dow.index or label_date < actual_dow.index.max():
+            idx = actual_dow.index.searchsorted(label_date)
+            if idx < len(actual_dow.index):
+                trading_day = actual_dow.index[idx]
+                
+                # Chart 1: Performance
+                val_actual = actual_dow.loc[trading_day]
+                val_cap = cap_weighted.loc[trading_day]
+                ax1.text(trading_day, val_actual + 5, f'{val_actual:.0f}', fontsize=9, color='#003366', fontweight='bold', ha='center', va='bottom')
+                ax1.text(trading_day, val_cap + 5, f'{val_cap:.0f}', fontsize=9, color='#CC0000', fontweight='bold', ha='center', va='bottom')
+
+                # Chart 2: Concentration
+                if trading_day in concentration['Date'].values:
+                    c_row = concentration[concentration['Date'] == trading_day].iloc[0]
+                    c_actual = c_row['Price-Weighted Top 10 (%)']
+                    c_cap = c_row['Cap-Weighted Top 10 (%)']
+                    ax2.text(trading_day, c_actual + 2, f'{c_actual:.0f}%', fontsize=9, color='#003366', fontweight='bold', ha='center', va='bottom')
+                    ax2.text(trading_day, c_cap + 2, f'{c_cap:.0f}%', fontsize=9, color='#CC0000', fontweight='bold', ha='center', va='bottom')
+
     plt.tight_layout()
     plt.savefig('dow_comparison_chart.png')
     
@@ -155,15 +199,43 @@ def main():
     print("\nYearly Performance Comparison (Dynamic Components):")
     years = range(2020, 2027)
     yearly_data = []
+    
+    # Calculate daily returns for metrics
+    actual_returns = actual_dow.pct_change().dropna()
+    cap_returns = cap_weighted.pct_change().dropna()
+    
     for year in years:
         year_start, year_end = pd.Timestamp(year, 1, 1), pd.Timestamp(year, 12, 31)
         if year == 2026: year_end = actual_dow.index.max()
         
-        m_a, m_c = (actual_dow.index >= year_start) & (actual_dow.index <= year_end), (cap_weighted.index >= year_start) & (cap_weighted.index <= year_end)
+        m_a = (actual_dow.index >= year_start) & (actual_dow.index <= year_end)
+        m_c = (cap_weighted.index >= year_start) & (cap_weighted.index <= year_end)
+        
         if m_a.any() and m_c.any():
+            # Returns
             r_a = (actual_dow[m_a].iloc[-1] / actual_dow[m_a].iloc[0] - 1) * 100
             r_c = (cap_weighted[m_c].iloc[-1] / cap_weighted[m_c].iloc[0] - 1) * 100
-            yearly_data.append({"Year": str(year) if year < 2026 else "2026 (YTD)", "Actual (%)": r_a, "Cap-Weighted (%)": r_c, "Diff (%)": r_c - r_a})
+            
+            # Sharpe (Annualized, assuming 0% risk-free rate)
+            ret_a_year = actual_returns[actual_returns.index.year == year]
+            ret_c_year = cap_returns[cap_returns.index.year == year]
+            
+            sharpe_a = (ret_a_year.mean() / ret_a_year.std() * np.sqrt(252)) if len(ret_a_year) > 1 else 0
+            sharpe_c = (ret_c_year.mean() / ret_c_year.std() * np.sqrt(252)) if len(ret_c_year) > 1 else 0
+            
+            # Max Drawdown
+            dd_a = (actual_dow[m_a] / actual_dow[m_a].cummax() - 1).min() * 100
+            dd_c = (cap_weighted[m_c] / cap_weighted[m_c].cummax() - 1).min() * 100
+            
+            yearly_data.append({
+                "Year": str(year) if year < 2026 else "2026 (YTD)",
+                "Actual Ret (%)": r_a,
+                "CapW Ret (%)": r_c,
+                "Actual Sharpe": sharpe_a,
+                "CapW Sharpe": sharpe_c,
+                "Actual MaxDD (%)": dd_a,
+                "CapW MaxDD (%)": dd_c
+            })
             
     print(pd.DataFrame(yearly_data).to_string(index=False, float_format="%.2f"))
 
